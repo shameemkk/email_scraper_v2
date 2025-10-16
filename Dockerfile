@@ -34,4 +34,4 @@ COPY . .
 EXPOSE 3000
 
 # Start the application
-CMD ["npm", "start"]
+CMD ["pm2-runtime", "start", "index.js", "--name", "email-extraction-api"]
