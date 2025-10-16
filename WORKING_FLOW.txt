@@ -1,0 +1,381 @@
+===============================================================================
+                    EMAIL SCRAPER API - COMPLETE WORKING FLOW (AI-generated)
+                           Beginner-Friendly Guide
+===============================================================================
+
+TABLE OF CONTENTS:
+1. What This System Does
+2. How It Works (Step by Step)
+3. Technical Architecture
+4. Job Processing Flow
+5. URL Crawling Strategy
+6. Data Storage
+7. Error Handling
+8. Configuration Options
+9. Example Usage Scenarios
+10. Troubleshooting Guide
+
+===============================================================================
+1. WHAT THIS SYSTEM DOES
+===============================================================================
+
+The Email Scraper API is a web service that:
+- Takes a website URL as input
+- Crawls through the website to find email addresses
+- Finds Facebook profile/page URLs
+- Processes multiple pages within the same domain
+- Handles both static HTML and JavaScript-rendered content
+- Stores results in a database for later retrieval
+- Processes multiple jobs simultaneously
+
+Think of it as a smart web crawler that specifically looks for contact information.
+
+===============================================================================
+2. HOW IT WORKS (STEP BY STEP)
+===============================================================================
+
+STEP 1: RECEIVING A REQUEST
+---------------------------
+When you send a POST request to /extract-emails:
+1. The API validates the URL format
+2. Creates a unique job ID (UUID)
+3. Adds the job to an internal queue
+4. Returns the job ID immediately
+
+STEP 2: JOB PROCESSING
+----------------------
+The system has background workers that:
+1. Check the queue for new jobs
+2. Pick up jobs (up to 3 at a time by default)
+3. Start processing each job independently
+4. Update job status to "processing"
+
+STEP 3: WEB CRAWLING
+--------------------
+For each job, the system:
+1. Starts with the main URL
+2. Tries to get the page content using fast HTTP requests (Cheerio)
+3. If that fails or content is empty, uses a full browser (Playwright)
+4. Extracts emails and Facebook URLs from the content
+5. Finds links to other pages on the same domain
+6. Repeats the process for found links (up to 2 levels deep)
+7. Continues until it hits the limit (15 URLs per job)
+
+STEP 4: DATA EXTRACTION
+-----------------------
+The system looks for:
+- Email addresses in mailto: links
+- Email addresses in HTML content
+- Email addresses in plain text
+- Facebook URLs (facebook.com, fb.com)
+- Navigation links for further crawling
+
+STEP 5: COMPLETION
+-----------------
+When done:
+1. Updates job status to "done" or "error"
+2. Saves results to Supabase database (if configured)
+3. Keeps results in memory for quick access
+4. Logs completion details
+
+===============================================================================
+3. TECHNICAL ARCHITECTURE
+===============================================================================
+
+COMPONENTS:
+-----------
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Express API   │    │  Internal Queue  │    │  Background     │
+│   (Endpoints)   │◄──►│  (In-Memory)     │◄──►│  Workers        │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+         │                       │                       │
+         │                       │                       ▼
+         │                       │              ┌─────────────────┐
+         │                       │              │  Web Crawlers   │
+         │                       │              │  (Cheerio +     │
+         │                       │              │   Playwright)   │
+         │                       │              └─────────────────┘
+         │                       │
+         ▼                       ▼
+┌─────────────────┐    ┌──────────────────┐
+│   Supabase      │    │  Job Results     │
+│   (Optional)    │    │  (In-Memory)     │
+└─────────────────┘    └──────────────────┘
+
+DATA FLOW:
+----------
+1. API receives request → Creates job → Adds to queue
+2. Worker picks job → Starts crawling → Updates status
+3. Crawler extracts data → Saves results → Marks complete
+4. Results stored in memory + Supabase (if configured)
+
+===============================================================================
+4. JOB PROCESSING FLOW
+===============================================================================
+
+JOB LIFECYCLE:
+--------------
+queued → processing → done/error
+
+DETAILED PROCESS:
+----------------
+1. JOB CREATION:
+   - Generate unique ID
+   - Set status to "queued"
+   - Add to internal queue
+   - Return job ID to user
+
+2. JOB PICKUP:
+   - Background worker checks queue
+   - Picks up to 3 jobs (if workers available)
+   - Changes status to "processing"
+   - Removes from queue
+
+3. JOB EXECUTION:
+   - Start with main URL
+   - Try Cheerio (fast) first
+   - Fall back to Playwright (slow but thorough)
+   - Extract emails and Facebook URLs
+   - Find more URLs to crawl
+   - Repeat until limits reached
+
+4. JOB COMPLETION:
+   - Collect all results
+   - Update status to "done" or "error"
+   - Save to Supabase (if configured)
+   - Log completion
+
+CONCURRENT PROCESSING:
+---------------------
+- Up to 3 jobs run simultaneously
+- Each job processes up to 15 URLs
+- Jobs are independent (don't interfere with each other)
+- Rate limiting prevents overwhelming target sites
+
+===============================================================================
+5. URL CRAWLING STRATEGY
+===============================================================================
+
+CRAWLING APPROACH:
+------------------
+1. START WITH MAIN URL
+   - Process the URL you provided
+   - Extract emails and Facebook URLs
+   - Find links to other pages
+
+2. SMART LINK DISCOVERY
+   - Focus on navigation links (nav, header, menu)
+   - Add common pages (/about, /contact, /about-us, etc.)
+   - Only crawl same-domain links
+   - Skip external links and fragments (#)
+
+3. DEPTH CONTROL
+   - Level 0: Main URL + common pages
+   - Level 1: Links found on those pages
+   - Level 2: Links found on level 1 pages
+   - Stop at MAX_DEPTH (default: 2)
+
+4. URL LIMITS
+   - Maximum 15 URLs per job
+   - Prevents jobs from running too long
+   - Balances thoroughness with performance
+
+TECHNICAL IMPLEMENTATION:
+------------------------
+- Cheerio: Fast HTML parsing for static content
+- Playwright: Full browser for JavaScript-heavy sites
+- Random delays: 200-800ms between requests
+- User-Agent spoofing: Appears as real browser
+- Error handling: Graceful fallbacks
+
+===============================================================================
+6. DATA STORAGE
+===============================================================================
+
+IN-MEMORY STORAGE (Primary):
+----------------------------
+- All jobs stored in JavaScript Map
+- Fast access for active jobs
+- Lost when server restarts
+- Used for job processing
+
+SUPABASE STORAGE (Persistence):
+------------------------------
+- Stores completed jobs only
+- Survives server restarts
+- Optional (works without it)
+- Used for historical data
+
+DATA STRUCTURE:
+--------------
+Each job contains:
+- job_id: Unique identifier
+- url: Original URL to crawl
+- status: queued/processing/done/error
+- emails: Array of found email addresses
+- facebook_urls: Array of found Facebook URLs
+- crawled_urls: Array of all URLs processed
+- pages_crawled: Number of pages processed
+- error: Error message (if failed)
+- created_at: Job creation timestamp
+- started_at: Processing start timestamp
+- completed_at: Completion timestamp
+
+===============================================================================
+7. ERROR HANDLING
+===============================================================================
+
+ERROR TYPES:
+------------
+1. NETWORK ERRORS: Connection timeouts, DNS failures
+2. PARSING ERRORS: Invalid HTML, encoding issues
+3. RATE LIMITING: Too many requests, blocked by server
+4. JAVASCRIPT ERRORS: Playwright rendering failures
+5. VALIDATION ERRORS: Invalid URLs, missing data
+
+ERROR HANDLING STRATEGY:
+-----------------------
+1. GRACEFUL DEGRADATION:
+   - Try Cheerio first, fall back to Playwright
+   - Continue processing other URLs if one fails
+   - Log errors but don't stop the job
+
+2. RETRY LOGIC:
+   - Random delays between requests
+   - Different user agents
+   - Timeout handling
+
+3. ERROR REPORTING:
+   - Detailed error messages
+   - Job status updates
+   - Console logging for debugging
+
+4. JOB RECOVERY:
+   - Mark failed jobs as "error"
+   - Save error details
+   - Continue with other jobs
+
+===============================================================================
+8. CONFIGURATION OPTIONS
+===============================================================================
+
+ENVIRONMENT VARIABLES:
+---------------------
+PORT=3000                          # Server port
+MAX_CONCURRENT_WORKERS=3           # Max simultaneous jobs
+WORKER_BATCH_SIZE=3                # Jobs processed per batch
+RATE_LIMIT_DELAY=500               # Delay between batches (ms)
+MAX_DEPTH=2                        # Maximum crawl depth
+SUPABASE_URL=your_url              # Supabase project URL
+SUPABASE_ANON_KEY=your_key         # Supabase anonymous key
+
+HARDCODED LIMITS:
+----------------
+- 15 URLs maximum per job
+- 200-800ms random delay between requests
+- 10 second timeout for HTTP requests
+- 30 second timeout for Playwright
+
+CUSTOMIZATION:
+--------------
+You can modify these limits by changing the code:
+- URL limit: Change the number 15 in the code
+- Delays: Modify the random delay calculation
+- Timeouts: Adjust REQUEST_TIMEOUT_MS and Playwright timeout
+- Depth: Change MAX_DEPTH environment variable
+
+===============================================================================
+9. EXAMPLE USAGE SCENARIOS
+===============================================================================
+
+SCENARIO 1: SIMPLE WEBSITE
+--------------------------
+Input: https://example.com
+Process:
+1. Crawl main page → Find 2 emails
+2. Crawl /about page → Find 1 more email
+3. Crawl /contact page → Find contact form
+4. Total: 3 emails, 0 Facebook URLs, 3 pages
+
+SCENARIO 2: COMPLEX WEBSITE
+---------------------------
+Input: https://company.com
+Process:
+1. Main page → JavaScript content, use Playwright
+2. Find navigation links → /about, /team, /contact
+3. Crawl each page → Find emails on each
+4. Find more links → /careers, /press
+5. Continue until 15 URL limit
+6. Total: 8 emails, 2 Facebook URLs, 15 pages
+
+SCENARIO 3: MINIMAL WEBSITE
+---------------------------
+Input: https://simple-site.com
+Process:
+1. Main page → Static HTML, use Cheerio
+2. No additional links found
+3. Total: 1 email, 0 Facebook URLs, 1 page
+
+SCENARIO 4: FAILED JOB
+----------------------
+Input: https://blocked-site.com
+Process:
+1. Main page → Rate limited, blocked
+2. Try Playwright → Still blocked
+3. Mark as error
+4. Total: 0 emails, 0 Facebook URLs, error status
+
+===============================================================================
+10. TROUBLESHOOTING GUIDE
+===============================================================================
+
+COMMON ISSUES:
+--------------
+
+1. "Job not found" error:
+   - Check if job ID is correct
+   - Job might be in Supabase (if configured)
+   - Server might have restarted (in-memory jobs lost)
+
+2. Job stuck in "processing" status:
+   - Check server logs for errors
+   - Job might be taking longer than expected
+   - Network issues with target website
+
+3. No emails found:
+   - Website might use JavaScript to load emails
+   - Emails might be in images (not extractable)
+   - Website might have anti-scraping measures
+
+4. Rate limiting errors:
+   - Target website is blocking requests
+   - Increase delays between requests
+   - Try different user agents
+
+5. Supabase connection errors:
+   - Check SUPABASE_URL and SUPABASE_ANON_KEY
+   - Verify Supabase project is active
+   - Check network connectivity
+
+DEBUGGING STEPS:
+----------------
+1. Check server logs for error messages
+2. Verify environment variables are set
+3. Test with simple websites first
+4. Check network connectivity
+5. Verify Supabase credentials (if using)
+
+PERFORMANCE TIPS:
+----------------
+1. Increase MAX_CONCURRENT_WORKERS for more parallel jobs
+2. Decrease RATE_LIMIT_DELAY for faster processing
+3. Adjust URL limits based on your needs
+4. Monitor server resources (CPU, memory)
+
+===============================================================================
+END OF WORKING FLOW GUIDE
+===============================================================================
+
+This guide should help you understand exactly how the Email Scraper API works
+from a technical perspective. If you have questions about any specific part,
+refer to the code comments or create an issue for clarification.
