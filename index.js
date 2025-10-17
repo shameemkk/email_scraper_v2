@@ -16,8 +16,8 @@ const PORT = process.env.PORT || 3000;
 
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
-const MAX_CONCURRENT_WORKERS = parseInt(process.env.MAX_CONCURRENT_WORKERS) || 3; 
-const WORKER_BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE) || 3;
+const MAX_CONCURRENT_WORKERS = parseInt(process.env.MAX_CONCURRENT_WORKERS) || 6; 
+const WORKER_BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE) || 6;
 const RATE_LIMIT_DELAY = parseInt(process.env.RATE_LIMIT_DELAY) || 500; // Shorter delay since we do fewer requests per job
 const MAX_DEPTH = parseInt(process.env.MAX_DEPTH) || 2;
 // This limit is less relevant now, as the job should only focus on finding the email
@@ -267,6 +267,18 @@ function extractFacebookUrls(text) {
   return [...new Set(finalUrls)]; // Remove duplicates
 }
 
+// URL cleaning function to remove hash fragments
+function cleanUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    urlObj.hash = ''; // Remove the hash fragment
+    return urlObj.href;
+  } catch (error) {
+    // If URL parsing fails, try simple string replacement
+    return url.split('#')[0];
+  }
+}
+
 // =========================================================================
 // DATABASE HELPER FUNCTIONS (Replaced with internal queue operations)
 // =========================================================================
@@ -397,8 +409,9 @@ async function scrapeUrl(url, depth, visitedUrls) {
           const href = $(el).attr('href');
           if (!href || href.startsWith('#') || href.startsWith('javascript:')) return null;
           try {
-            // Convert to absolute URL
-            return new URL(href, url).href;
+            // Convert to absolute URL and clean hash fragments
+            const absoluteUrl = new URL(href, url).href;
+            return cleanUrl(absoluteUrl);
           } catch {
             return null;
           }
@@ -426,12 +439,31 @@ async function scrapeUrl(url, depth, visitedUrls) {
       const page = await browser.newPage();
       
       // Set a strict timeout (e.g., 30 seconds for the full page load/render)
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); 
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 }); 
       
-      // Wait a short time for any lazy-loaded content (optional, adjust as needed)
-      await page.waitForTimeout(500); 
+      // Wait for page to be fully loaded and any dynamic content to render
+      await page.waitForLoadState('networkidle');
+      
+      // Additional wait for any lazy-loaded content or dynamic elements
+      await page.waitForTimeout(1000);
+      
+      // Try to wait for common email-related elements to be present
+      try {
+        await page.waitForSelector('a[href*="mailto:"] ', { timeout: 1000 });
+      } catch (e) {
+        console.log('[Playwright] No email-related selectors found, continuing...');
+      } 
 
       htmlContent = await page.content();
+      
+      // Debug logging to see what content was loaded
+      console.log(`[Playwright] HTML content length: ${htmlContent.length}`);
+      console.log(`[Playwright] Contains mailto: ${htmlContent.includes('mailto:')}`);
+      console.log(`[Playwright] Contains angelcityclean: ${htmlContent.includes('angelcityclean')}`);
+      if (htmlContent.includes('mailto:')) {
+        const mailtoMatches = htmlContent.match(/href=["']mailto:([^"']+)["']/gi);
+        console.log(`[Playwright] Found mailto links:`, mailtoMatches);
+      }
       
       let emails = extractEmails(htmlContent);
       result.emails.push(...emails);
@@ -456,10 +488,11 @@ async function scrapeUrl(url, depth, visitedUrls) {
         for (const link of links) {
           try {
             const absoluteUrl = new URL(link, url).href; // Convert to absolute URL using the current page URL
-            const linkUrl = new URL(absoluteUrl);
+            const cleanAbsoluteUrl = cleanUrl(absoluteUrl); // Remove hash fragments
+            const linkUrl = new URL(cleanAbsoluteUrl);
             // Only include links from the same origin
             if (linkUrl.origin === baseUrl.origin) {
-              sameDomainLinks.push(absoluteUrl);
+              sameDomainLinks.push(cleanAbsoluteUrl);
             }
           } catch {
             // Skip invalid URLs
@@ -467,7 +500,7 @@ async function scrapeUrl(url, depth, visitedUrls) {
         }
 
         // Add specific common pages to crawl
-        const commonPages = ['/about/', '/contact/', '/about', '/contact', '/about-us/', '/contact-us/'];
+        const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/'];
         for (const page of commonPages) {
           try {
             const fullUrl = new URL(page, url).href; // Use 'url' not 'baseUrl.origin'
