@@ -16,8 +16,8 @@ const PORT = process.env.PORT || 3000;
 
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
-const MAX_CONCURRENT_WORKERS = parseInt(process.env.MAX_CONCURRENT_WORKERS) || 6; 
-const WORKER_BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE) || 6;
+const MAX_CONCURRENT_WORKERS = parseInt(process.env.MAX_CONCURRENT_WORKERS) || 25; 
+const WORKER_BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE) || 25;
 const RATE_LIMIT_DELAY = parseInt(process.env.RATE_LIMIT_DELAY) || 500; // Shorter delay since we do fewer requests per job
 const MAX_DEPTH = parseInt(process.env.MAX_DEPTH) || 2;
 // This limit is less relevant now, as the job should only focus on finding the email
@@ -500,7 +500,7 @@ async function scrapeUrl(url, depth, visitedUrls) {
         }
 
         // Add specific common pages to crawl
-        const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/'];
+        const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/', '/privacy', '/terms'];
         for (const page of commonPages) {
           try {
             const fullUrl = new URL(page, url).href; // Use 'url' not 'baseUrl.origin'
