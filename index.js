@@ -439,8 +439,8 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       browser = await chromium.launch({ headless: true });
       const page = await browser.newPage();
       
-      // Set a strict timeout (e.g., 30 seconds for the full page load/render)
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 }); 
+      // Set a strict timeout (e.g., 40 seconds for the full page load/render)
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 40000 }); 
       
       // Wait for page to be fully loaded and any dynamic content to render
       await page.waitForLoadState('networkidle');
