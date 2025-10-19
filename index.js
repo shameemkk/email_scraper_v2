@@ -732,6 +732,12 @@ app.post('/extract-emails', async (req, res) => { /* ... (Endpoint implementatio
     // Create job in database
     const job = await createJob(jobId, url);
 
+    // Ensure background worker is running (self-healing)
+    if (!jobWorker.isRunning) {
+      console.log('Worker was stopped, restarting...');
+      jobWorker.start().catch(err => console.error('Failed to restart worker:', err));
+    }
+
     res.json({
       success: true,
       message: 'Job queued successfully',
