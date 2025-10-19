@@ -348,9 +348,10 @@ async function getJob(jobId) {
  * @param {string} url - The URL to scrape.
  * @param {number} depth - The current crawl depth (for recursive calls).
  * @param {Set<string>} visitedUrls - Set of URLs already visited in this job.
+ * @param {string} jobId - The parent job identifier for error reporting.
  * @returns {Promise<{emails: string[], facebookUrls: string[], newUrls: string[]}>}
  */
-async function scrapeUrl(url, depth, visitedUrls) {
+async function scrapeUrl(url, depth, visitedUrls, jobId) {
   const result = {
     emails: [],
     facebookUrls: [],
@@ -514,10 +515,27 @@ async function scrapeUrl(url, depth, visitedUrls) {
       console.log(`[Playwright] Found ${result.emails.length} emails and ${result.newUrls.length} new URLs.`);
 
     } catch (error) {
-      console.error(`[Playwright Error] Failed to process ${url}: ${error.message}`);
+      console.error(`[Playwright Error] Failed to process ${url}:`, error);
+      // Update job in Supabase/internal queue with error status to avoid stuck processing
+      if (jobId && typeof updateJobStatus === 'function') {
+        try {
+          await updateJobStatus(jobId, 'error', {
+            error: `[Playwright Error] ${error && error.message ? error.message : 'Unknown error'}`
+          });
+        } catch (statusErr) {
+          console.error('Failed to update job status after Playwright error:', statusErr);
+        }
+      }
+      // Re-throw to let the caller fail the job and stop further processing
+      throw error;
     } finally {
       if (browser) {
-        await browser.close();
+        try {
+          await browser.close();
+          console.log(`[Playwright] Browser closed for ${url}`);
+        } catch (closeErr) {
+          console.error(`[Playwright Close Error] ${closeErr.message}`);
+        }
       }
     }
   }
@@ -569,7 +587,7 @@ async function processJob(jobId, url) {
       }
       
       try {
-        const scrapeResult = await scrapeUrl(currentUrl, currentDepth, visitedUrls);
+        const scrapeResult = await scrapeUrl(currentUrl, currentDepth, visitedUrls, jobId);
         crawlCount++;
         
         // Add results
@@ -595,7 +613,9 @@ async function processJob(jobId, url) {
         });
         
       } catch (e) {
-        console.error(`Error during scraping ${currentUrl}: ${e.message}`);
+        console.error(`Error during scraping ${currentUrl}: ${e && e.message ? e.message : e}`);
+        // Abort this job to avoid marking it as done after a fatal scraping failure
+        throw e;
       }
     }
 
