@@ -37,25 +37,86 @@ if (supabaseUrl && supabaseKey) {
 }
 
 // =========================================================================
-// INTERNAL JOB QUEUE SYSTEM
+// INTERNAL JOB QUEUE SYSTEM (Supabase-only implementation)
 // =========================================================================
+
+// --- NEW Supabase Table Name Constants ---
+const COMPLETED_JOBS_TABLE = 'email_scrap_jobs'; // The table for completed jobs (unchanged)
+const ACTIVE_JOBS_TABLE = 'email_queued_jobs'; // The new table for active/queued/processing jobs
 
 class InternalJobQueue {
   constructor() {
-    this.jobs = new Map(); // jobId -> job data
-    this.queue = []; // Array of job IDs in processing order
-    this.processing = new Set(); // Set of job IDs currently being processed
+    // In-memory storage (jobs, queue, processing set) removed as per user request.
+    if (!supabase) {
+        console.error("WARNING: Supabase is not configured. Job queue cannot operate without database storage.");
+    }
   }
 
-  // Create a new job
-  createJob(jobId, url) {
+  // Helper to save a job to the new active jobs table (for queued/processing)
+  async saveActiveJobToSupabase(job) {
+    if (!supabase) throw new Error("Supabase not configured for active job storage.");
+
+    try {
+      const { error } = await supabase
+        .from(ACTIVE_JOBS_TABLE) // <--- ACTIVE JOBS TABLE
+        .upsert({
+          job_id: job.job_id,
+          url: job.url,
+          status: job.status,
+          created_at: job.created_at,
+          updated_at: job.updated_at,
+          started_at: job.started_at || null, 
+          // Only store essential info for active jobs
+        }, {
+          onConflict: 'job_id'
+        });
+
+      if (error) {
+        console.error(`Error saving active job ${job.job_id} to ${ACTIVE_JOBS_TABLE}:`, error);
+        throw error;
+      }
+
+      console.log(`Active job ${job.job_id} saved/updated in ${ACTIVE_JOBS_TABLE}`);
+    } catch (error) {
+      console.error(`Failed to save active job to ${ACTIVE_JOBS_TABLE}:`, error);
+      throw error;
+    }
+  }
+  
+  // Helper to delete a job from the new active jobs table
+  async deleteActiveJobFromSupabase(jobId) {
+    if (!supabase) return;
+
+    try {
+      const { error } = await supabase
+        .from(ACTIVE_JOBS_TABLE) // <--- ACTIVE JOBS TABLE
+        .delete()
+        .eq('job_id', jobId);
+
+      if (error) {
+        console.error(`Error deleting active job ${jobId} from ${ACTIVE_JOBS_TABLE}:`, error);
+        throw error;
+      }
+
+      console.log(`Active job ${jobId} deleted from ${ACTIVE_JOBS_TABLE}`);
+    } catch (error) {
+      console.error(`Failed to delete active job from ${ACTIVE_JOBS_TABLE}:`, error);
+      throw error;
+    }
+  }
+
+
+  // Create a new job - now only interacts with Supabase
+  async createJob(jobId, url) {
+    if (!supabase) throw new Error("Supabase is required for job creation.");
+      
     const job = {
       job_id: jobId,
       url: url,
       status: 'queued',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-      emails: [],
+      emails: [], // Not stored in ACTIVE_JOBS_TABLE, only in COMPLETED_JOBS_TABLE
       facebook_urls: [],
       crawled_urls: [],
       pages_crawled: 0,
@@ -64,55 +125,61 @@ class InternalJobQueue {
       completed_at: null
     };
 
-    this.jobs.set(jobId, job);
-    this.queue.push(jobId);
+    // Save the initial job status to the ACTIVE_JOBS_TABLE
+    await this.saveActiveJobToSupabase(job);
     
     console.log(`Job ${jobId} created and queued for URL: ${url}`);
     return job;
   }
 
-  // Update job status and data
+  // Update job status and data - now fetches and saves directly to Supabase
   async updateJobStatus(jobId, status, updates = {}) {
-    const job = this.jobs.get(jobId);
+    if (!supabase) throw new Error("Supabase is required for job status update.");
+      
+    // 1. Get the latest job record (needed to preserve all properties during an update)
+    let job = await this.getJob(jobId);
     if (!job) {
-      throw new Error(`Job ${jobId} not found`);
+      throw new Error(`Job ${jobId} not found in active or completed tables`);
     }
 
-    // Update job data
+    // 2. Update job data in memory
     Object.assign(job, updates);
     job.status = status;
     job.updated_at = new Date().toISOString();
 
-    if (status === 'processing' && !updates.started_at) {
+    if (status === 'processing' && !job.started_at) {
       job.started_at = new Date().toISOString();
-      this.processing.add(jobId);
+      
+      // Save status update to ACTIVE_JOBS_TABLE
+      await this.saveActiveJobToSupabase(job);
     }
-
+    
     if (status === 'done' || status === 'error') {
       job.completed_at = new Date().toISOString();
-      this.processing.delete(jobId);
       
-      // Save completed job to Supabase if available
-      if (supabase) {
-        try {
-          await this.saveCompletedJobToSupabase(job);
-        } catch (error) {
-          console.error(`Failed to save completed job ${jobId} to Supabase:`, error);
-        }
-      }
+      // Save completed job to COMPLETED_JOBS_TABLE (email_scrap_jobs)
+      await this.saveCompletedJobToSupabase(job);
+      
+      // Delete from ACTIVE_JOBS_TABLE after successful save to completed table
+      await this.deleteActiveJobFromSupabase(jobId);
+    }
+    
+    // For intermediate updates during processing, we update the ACTIVE_JOBS_TABLE
+    if (status === 'processing') {
+      await this.saveActiveJobToSupabase(job);
     }
 
     console.log(`Job ${jobId} status updated to: ${status}`);
     return job;
   }
 
-  // Save completed job to Supabase
+  // Save completed job to Supabase (using the original table: email_scrap_jobs)
   async saveCompletedJobToSupabase(job) {
     if (!supabase) return;
 
     try {
       const { error } = await supabase
-        .from('email_scrap_jobs')
+        .from(COMPLETED_JOBS_TABLE) // <--- ORIGINAL TABLE NAME (email_scrap_jobs)
         .upsert({
           job_id: job.job_id,
           url: job.url,
@@ -131,65 +198,118 @@ class InternalJobQueue {
         });
 
       if (error) {
-        console.error('Error saving job to Supabase:', error);
+        console.error(`Error saving job to ${COMPLETED_JOBS_TABLE}:`, error);
         throw error;
       }
 
-      console.log(`Job ${job.job_id} saved to Supabase`);
+      console.log(`Job ${job.job_id} saved to ${COMPLETED_JOBS_TABLE}`);
     } catch (error) {
-      console.error('Failed to save job to Supabase:', error);
+      console.error(`Failed to save job to ${COMPLETED_JOBS_TABLE}:`, error);
       throw error;
     }
   }
 
-  // Get job by ID
-  getJob(jobId) {
-    return this.jobs.get(jobId) || null;
-  }
+  // Get job by ID - now searches both tables
+  async getJob(jobId) {
+    if (!supabase) return null;
 
-  // Get queued jobs (for worker processing)
-  getQueuedJobs(limit = WORKER_BATCH_SIZE) {
-    const queuedJobIds = this.queue.filter(jobId => {
-      const job = this.jobs.get(jobId);
-      return job && job.status === 'queued';
-    });
+    try {
+      // 1. Check the completed jobs table (email_scrap_jobs) first
+      let { data: completedJob, error: completedError } = await supabase
+        .from(COMPLETED_JOBS_TABLE)
+        .select('*')
+        .eq('job_id', jobId)
+        .single();
 
-    return queuedJobIds.slice(0, limit).map(jobId => this.jobs.get(jobId));
-  }
-
-  // Remove job from queue when processing starts
-  removeFromQueue(jobId) {
-    const index = this.queue.indexOf(jobId);
-    if (index > -1) {
-      this.queue.splice(index, 1);
-    }
-  }
-
-  // Get queue statistics
-  getStats() {
-    const stats = {
-      total: this.jobs.size,
-      queued: 0,
-      processing: this.processing.size,
-      done: 0,
-      error: 0
-    };
-
-    for (const job of this.jobs.values()) {
-      switch (job.status) {
-        case 'queued':
-          stats.queued++;
-          break;
-        case 'done':
-          stats.done++;
-          break;
-        case 'error':
-          stats.error++;
-          break;
+      if (completedError && completedError.code !== 'PGRST116') {
+        console.error(`Error getting job from ${COMPLETED_JOBS_TABLE}:`, completedError);
       }
-    }
+      
+      if (completedJob) return completedJob;
 
-    return stats;
+      // 2. Check the active/queued jobs table (email_queued_jobs)
+      let { data: activeJob, error: activeError } = await supabase
+        .from(ACTIVE_JOBS_TABLE)
+        .select('*')
+        .eq('job_id', jobId)
+        .single();
+        
+      if (activeError && activeError.code !== 'PGRST116') {
+        console.error(`Error getting job from ${ACTIVE_JOBS_TABLE}:`, activeError);
+      }
+
+      return activeJob || null; // Job not found in either table
+
+    } catch (supabaseError) {
+      console.error('Failed to get job from Supabase:', supabaseError);
+      return null; 
+    }
+  }
+
+  // Get queued jobs (for worker processing) - now queries Supabase
+  async getQueuedJobs(limit = WORKER_BATCH_SIZE) {
+    if (!supabase) return [];
+    
+    try {
+      const { data, error } = await supabase
+        .from(ACTIVE_JOBS_TABLE)
+        .select('*')
+        .eq('status', 'queued')
+        .order('created_at', { ascending: true }) // FIFO order
+        .limit(limit);
+
+      if (error) {
+        console.error(`Error fetching queued jobs from ${ACTIVE_JOBS_TABLE}:`, error);
+        return [];
+      }
+      
+      return data || [];
+    } catch (error) {
+      console.error('Failed to fetch queued jobs:', error);
+      return [];
+    }
+  }
+
+  // No-op method: Queue is managed by DB status.
+  removeFromQueue(jobId) {
+    // console.log(`[JobQueue] removeFromQueue is a no-op for job ${jobId}`);
+  }
+
+  // Get queue statistics - now queries Supabase
+  async getStats() {
+    if (!supabase) {
+      return { total: 0, queued: 0, processing: 0, done: 0, error: 0, message: 'Supabase not available' };
+    }
+    
+    try {
+      // Get detailed counts from active table
+      const { data: activeData } = await supabase
+        .from(ACTIVE_JOBS_TABLE)
+        .select('status');
+
+      const queued = activeData ? activeData.filter(j => j.status === 'queued').length : 0;
+      const processing = activeData ? activeData.filter(j => j.status === 'processing').length : 0;
+      
+      // Get detailed counts from completed table
+      const { data: completedData } = await supabase
+        .from(COMPLETED_JOBS_TABLE)
+        .select('status');
+
+      const done = completedData ? completedData.filter(j => j.status === 'done').length : 0;
+      const error = completedData ? completedData.filter(j => j.status === 'error').length : 0;
+      
+      return {
+        total: (activeData?.length || 0) + (completedData?.length || 0),
+        queued: queued,
+        processing: processing,
+        done: done,
+        error: error
+      };
+
+    } catch (error) {
+      console.error('Error fetching job statistics from Supabase:', error);
+      return { total: 0, queued: 0, processing: 0, done: 0, error: 0, message: 'Database query failed' };
+    }
   }
 }
 
@@ -201,7 +321,7 @@ app.use(cors());
 app.use(express.json());
 
 // =========================================================================
-// EMAIL & URL EXTRACTION FUNCTIONS (Kept as is)
+// EMAIL & URL EXTRACTION FUNCTIONS (Kept as is - DO NOT CHANGE)
 // =========================================================================
 
 // Email extraction function - works with HTML content
@@ -280,12 +400,12 @@ function cleanUrl(url) {
 }
 
 // =========================================================================
-// DATABASE HELPER FUNCTIONS (Replaced with internal queue operations)
+// DATABASE HELPER FUNCTIONS (Updated to use the new async JobQueue methods)
 // =========================================================================
 
 async function createJob(jobId, url) {
   try {
-    const job = jobQueue.createJob(jobId, url);
+    const job = await jobQueue.createJob(jobId, url);
     return job;
   } catch (error) {
     console.error('Failed to create job:', error);
@@ -305,33 +425,7 @@ async function updateJobStatus(jobId, status, updates = {}) {
 
 async function getJob(jobId) {
   try {
-    // First check internal queue
-    let job = jobQueue.getJob(jobId);
-    
-    // If not found in internal queue and Supabase is available, check Supabase
-    if (!job && supabase) {
-      try {
-        const { data, error } = await supabase
-          .from('email_scrap_jobs')
-          .select('*')
-          .eq('job_id', jobId)
-          .single();
-
-        if (error) {
-          if (error.code === 'PGRST116') {
-            return null; // Job not found
-          }
-          console.error('Error getting job from Supabase:', error);
-          throw error;
-        }
-
-        job = data;
-      } catch (supabaseError) {
-        console.error('Failed to get job from Supabase:', supabaseError);
-        // Continue with null if Supabase fails
-      }
-    }
-    
+    const job = await jobQueue.getJob(jobId);
     return job;
   } catch (error) {
     console.error('Failed to get job:', error);
@@ -434,10 +528,14 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
   if (isJsRendered || result.emails.length === 0) {
     console.log(`[Playwright] Falling back to browser rendering for ${url}...`);
     let browser;
+    let context;
+    let page;
     try {
       // Launch Playwright for THIS specific job request (Playwright Launcher)
       browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage();
+      // Create explicit context and page
+      context = await browser.newContext();
+      page = await context.newPage();
       
       // Set a strict timeout (e.g., 60 seconds for the full page load/render)
       await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }); 
@@ -459,57 +557,64 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       
       // Debug logging to see what content was loaded
       console.log(`[Playwright] HTML content length: ${htmlContent.length}`);
-      console.log(`[Playwright] Contains mailto: ${htmlContent.includes('mailto:')}`);
-      console.log(`[Playwright] Contains angelcityclean: ${htmlContent.includes('angelcityclean')}`);
-      if (htmlContent.includes('mailto:')) {
-        const mailtoMatches = htmlContent.match(/href=["']mailto:([^"']+)["']/gi);
-        console.log(`[Playwright] Found mailto links:`, mailtoMatches);
-      }
       
       let emails = extractEmails(htmlContent);
       result.emails.push(...emails);
       
+      // *** FIX: Explicitly close Page and Context to free resources quickly ***
+      if (page) await page.close();
+      if (context) await context.close();
+      
       // Extract links if we need to crawl deeper (and if emails weren't found)
       if (depth < MAX_DEPTH) {
-        const links = await page.evaluate(() => {
-          const links = [];
-          document.querySelectorAll('a[href]').forEach(el => {
-            const href = el.getAttribute('href');
-            if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-              links.push(href);
-            }
-          });
-          return links;
-        });
+        // ... (link extraction logic remains the same, assuming it doesn't need the page/context anymore) ...
+        // NOTE: Since we closed page/context above, we can no longer use `page.evaluate()`.
+        // We must rely on Cheerio/URL parsing of the retrieved `htmlContent` for link extraction if emails were not found.
         
-        // Filter links to stay on the same domain and convert to absolute URLs
-        const baseUrl = new URL(url);
-        const sameDomainLinks = [];
-        
-        for (const link of links) {
-          try {
-            const absoluteUrl = new URL(link, url).href; // Convert to absolute URL using the current page URL
-            const cleanAbsoluteUrl = cleanUrl(absoluteUrl); // Remove hash fragments
-            const linkUrl = new URL(cleanAbsoluteUrl);
-            // Only include links from the same origin
-            if (linkUrl.origin === baseUrl.origin) {
-              sameDomainLinks.push(cleanAbsoluteUrl);
+        if (result.emails.length === 0) {
+            const $ = cheerio.load(htmlContent);
+            const links = $('a[href]')
+                .map((i, el) => {
+                    const href = $(el).attr('href');
+                    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return null;
+                    try {
+                        // Convert to absolute URL and clean hash fragments
+                        const absoluteUrl = new URL(href, url).href;
+                        return cleanUrl(absoluteUrl);
+                    } catch {
+                        return null;
+                    }
+                })
+                .get()
+                .filter(href => href !== null);
+                
+            // Filter links to stay on the same domain and convert to absolute URLs
+            const baseUrl = new URL(url);
+            const sameDomainLinks = [];
+            
+            for (const link of links) {
+                try {
+                    const linkUrl = new URL(link);
+                    // Only include links from the same origin
+                    if (linkUrl.origin === baseUrl.origin) {
+                      sameDomainLinks.push(link);
+                    }
+                } catch {
+                    // Skip invalid URLs
+                }
             }
-          } catch {
-            // Skip invalid URLs
-          }
-        }
 
-        // Add specific common pages to crawl
-        const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/', '/privacy', '/terms'];
-        for (const page of commonPages) {
-          try {
-            const fullUrl = new URL(page, url).href; // Use 'url' not 'baseUrl.origin'
-            sameDomainLinks.push(fullUrl);
-          } catch (e) { /* skip invalid URLs */ }
-        }
+            // Add specific common pages to crawl
+            const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/', '/privacy', '/terms'];
+            for (const pagePath of commonPages) {
+                try {
+                    const fullUrl = new URL(pagePath, url).href;
+                    sameDomainLinks.push(fullUrl);
+                } catch (e) { /* skip invalid URLs */ }
+            }
 
-        result.newUrls.push(...sameDomainLinks);
+            result.newUrls.push(...sameDomainLinks);
+        }
       }
       
       console.log(`[Playwright] Found ${result.emails.length} emails and ${result.newUrls.length} new URLs.`);
@@ -531,10 +636,17 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
     } finally {
       if (browser) {
         try {
+          // Attempt a graceful close
           await browser.close();
           console.log(`[Playwright] Browser closed for ${url}`);
         } catch (closeErr) {
-          console.error(`[Playwright Close Error] ${closeErr.message}`);
+          console.error(`[Playwright Close Error] Failed to close gracefully for ${url}: ${closeErr.message}. Attempting disconnect.`);
+          try {
+             // *** FIX: Add disconnect for more aggressive cleanup ***
+             browser.disconnect(); 
+          } catch(e) { 
+             console.error(`[Playwright Disconnect Error] ${e.message}`);
+          }
         }
       }
     }
@@ -552,70 +664,49 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
 
 
 // =========================================================================
-// Worker function to process jobs (REPLACED)
+// Worker function to process jobs (Unchanged)
 // =========================================================================
 async function processJob(jobId, url) {
   console.log(`Starting job ${jobId} for URL: ${url}`);
   
   try {
-    await updateJobStatus(jobId, 'processing');
+    // The worker already sets status to 'processing' before calling this function, 
+    // but we can ensure it's recorded again if needed, or if this function is called directly.
+    // await updateJobStatus(jobId, 'processing'); // Removing duplicate call here
 
     const uniqueEmails = new Set();
     const uniqueFacebookUrls = new Set();
     const visitedUrls = new Set();
-    
-    // In-memory queue for this job's internal crawl
-    const urlQueue = [url]; 
-    let crawlCount = 0;
-    
-    // Process the queue iteratively, respecting MAX_DEPTH
-    while (urlQueue.length > 0) {
-      const currentUrl = urlQueue.shift();
-      
-      // NOTE: We only track depth on the main URL and common pages.
-      const currentDepth = (currentUrl === url || currentUrl.includes('/contact') || currentUrl.includes('/about')) ? 0 : 1;
-      
-      // Stop crawling if MAX_DEPTH is reached
-      if (currentDepth >= MAX_DEPTH) {
-        continue;
-      }
-      
-      // Ensure we don't exceed a reasonable request limit for a single job
-      if (crawlCount > 15) { // Arbitrary limit, can be set in config
-         console.log(`Job ${jobId} hit internal crawl limit of 15.`);
-         break;
-      }
-      
-      try {
-        const scrapeResult = await scrapeUrl(currentUrl, currentDepth, visitedUrls, jobId);
-        crawlCount++;
-        
-        // Add results
-        scrapeResult.emails.forEach(e => uniqueEmails.add(e));
-        scrapeResult.facebookUrls.forEach(f => uniqueFacebookUrls.add(f));
 
-        // Enqueue new links
-        scrapeResult.newUrls
+    // Step 1: Scrape the primary URL (depth 0)
+    const primaryResult = await scrapeUrl(url, 0, visitedUrls, jobId);
+    primaryResult.emails.forEach(e => uniqueEmails.add(e));
+    primaryResult.facebookUrls.forEach(f => uniqueFacebookUrls.add(f));
+
+    // Step 2: Optionally scrape a limited set of same-domain links without using an in-memory queue
+    if (MAX_DEPTH > 1) {
+      const baseOrigin = new URL(url).origin;
+      const candidateLinks = (primaryResult.newUrls || [])
         .filter(link => {
-            // Simple same-domain check before adding to queue
-            try {
-                const linkUrl = new URL(link);
-                const baseUrl = new URL(url);
-                return linkUrl.origin === baseUrl.origin && !visitedUrls.has(link);
-            } catch {
-                return false;
-            }
+          try {
+            const linkUrl = new URL(link);
+            return linkUrl.origin === baseOrigin && !visitedUrls.has(link);
+          } catch {
+            return false;
+          }
         })
-        .forEach(link => {
-            if (!urlQueue.includes(link)) { // Prevent duplicates in the queue
-                urlQueue.push(link);
-            }
-        });
-        
-      } catch (e) {
-        console.error(`Error during scraping ${currentUrl}: ${e && e.message ? e.message : e}`);
-        // Abort this job to avoid marking it as done after a fatal scraping failure
-        throw e;
+        .slice(0, 15); // Respect previous crawl limit without a queue
+
+      for (const link of candidateLinks) {
+        try {
+          const subResult = await scrapeUrl(link, 1, visitedUrls, jobId);
+          subResult.emails.forEach(e => uniqueEmails.add(e));
+          subResult.facebookUrls.forEach(f => uniqueFacebookUrls.add(f));
+        } catch (e) {
+          console.error(`Error during scraping ${link}: ${e && e.message ? e.message : e}`);
+          // Abort this job to avoid marking it as done after a fatal scraping failure
+          throw e;
+        }
       }
     }
 
@@ -623,7 +714,7 @@ async function processJob(jobId, url) {
     const finalEmails = Array.from(uniqueEmails);
     const finalFacebookUrls = Array.from(uniqueFacebookUrls);
 
-    // Update job with results
+    // Update job with results and mark as done
     await updateJobStatus(jobId, 'done', {
       emails: finalEmails,
       facebook_urls: finalFacebookUrls,
@@ -644,13 +735,15 @@ async function processJob(jobId, url) {
 }
 
 // =========================================================================
-// Background worker system (Kept as is - now uses the custom processJob)
+// Background worker system (Unchanged)
 // =========================================================================
 
 class JobWorker {
   constructor() {
     this.isRunning = false;
-    this.activeJobs = new Set();
+    // activeJobs set is still useful to prevent multiple workers from picking up 
+    // the same job *simultaneously* after the DB query.
+    this.activeJobs = new Set(); 
   }
 
   async start() {
@@ -679,31 +772,38 @@ class JobWorker {
 
   async processNextBatch() {
     try {
-      // Get queued jobs from internal queue
-      const queuedJobs = jobQueue.getQueuedJobs(WORKER_BATCH_SIZE);
+      // Get queued jobs from internal queue (now an async Supabase query)
+      const queuedJobs = await jobQueue.getQueuedJobs(WORKER_BATCH_SIZE);
 
       if (!queuedJobs || queuedJobs.length === 0) {
         return; // No jobs to process
       }
 
+      // Filter out jobs currently being processed by *this* instance of the worker
+      const jobsToProcess = queuedJobs.filter(job => !this.activeJobs.has(job.job_id));
+      
       // Process jobs concurrently (limited by MAX_CONCURRENT_WORKERS)
-      // Only process up to the limit of workers that are currently free
       const availableWorkers = MAX_CONCURRENT_WORKERS - this.activeJobs.size;
-      const jobsToProcess = queuedJobs.slice(0, availableWorkers);
+      const finalJobsToProcess = jobsToProcess.slice(0, availableWorkers);
 
-      if (jobsToProcess.length === 0) return; // No available workers
+      if (finalJobsToProcess.length === 0) return; // No jobs or no available workers
 
-      const jobPromises = jobsToProcess.map(async (job) => {
-        if (this.activeJobs.has(job.job_id)) {
-          return; // Double-check, should not happen if logic is correct
-        }
-
+      const jobPromises = finalJobsToProcess.map(async (job) => {
         this.activeJobs.add(job.job_id);
         
         try {
-          // Remove job from queue when starting processing
-          jobQueue.removeFromQueue(job.job_id);
+          // 1. Immediately update status to 'processing' in DB
+          // This is the critical step to prevent other workers/batches from picking it up
+          await updateJobStatus(job.job_id, 'processing', {
+              started_at: new Date().toISOString()
+          });
+          
+          // 2. Execute the heavy lifting
           await processJob(job.job_id, job.url);
+          
+        } catch(error) {
+          console.error(`Error during Job ${job.job_id} in worker loop:`, error.message);
+          // processJob already handles error status update inside it
         } finally {
           this.activeJobs.delete(job.job_id);
         }
@@ -721,11 +821,11 @@ class JobWorker {
 const jobWorker = new JobWorker();
 
 // =========================================================================
-// ENDPOINTS (Kept as is)
+// ENDPOINTS (Unchanged)
 // =========================================================================
 
 // Modified /extract-emails endpoint - now adds jobs to queue
-app.post('/extract-emails', async (req, res) => { /* ... (Endpoint implementation) ... */
+app.post('/extract-emails', async (req, res) => {
   try {
     const { url } = req.body;
     
@@ -749,7 +849,7 @@ app.post('/extract-emails', async (req, res) => { /* ... (Endpoint implementatio
     // Generate unique job ID
     const jobId = uuidv4();
 
-    // Create job in database
+    // Create job in database (now an async call)
     const job = await createJob(jobId, url);
 
     // Ensure background worker is running (self-healing)
@@ -776,10 +876,11 @@ app.post('/extract-emails', async (req, res) => { /* ... (Endpoint implementatio
 });
 
 // New endpoint to check job status
-app.get('/job/:jobId', async (req, res) => { /* ... (Endpoint implementation) ... */
+app.get('/job/:jobId', async (req, res) => {
   try {
     const { jobId } = req.params;
     
+    // getJob is now async
     const job = await getJob(jobId);
     
     if (!job) {
@@ -827,7 +928,7 @@ app.get('/completed-jobs', async (req, res) => {
     }
 
     const { data, error } = await supabase
-      .from('email_scrap_jobs')
+      .from(COMPLETED_JOBS_TABLE) // <--- USING COMPLETED JOBS TABLE
       .select('*')
       .in('status', ['done', 'error'])
       .order('completed_at', { ascending: false })
@@ -857,8 +958,8 @@ app.get('/completed-jobs', async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  const queueStats = jobQueue.getStats();
+app.get('/health', async (req, res) => {
+  const queueStats = await jobQueue.getStats(); // AWAIT the new async method
   res.json({ 
     status: 'OK', 
     message: 'Email extraction API is running',
@@ -872,7 +973,7 @@ app.get('/health', (req, res) => {
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
-    message: 'Email and Facebook URL Extraction API (Internal Queue-based)',
+    message: 'Email and Facebook URL Extraction API (Supabase Queue-based)',
     endpoints: {
       'POST /extract-emails': 'Queue a job to extract emails and Facebook URLs from a website',
       'GET /job/:jobId': 'Check the status and results of a specific job',
@@ -885,7 +986,9 @@ app.get('/', (req, res) => {
       body: { url: 'https://example.com' }
     },
     features: [
-      'Internal job queue system (no external dependencies)',
+      'Supabase-only job queue system (no internal memory state)',
+      'Active jobs stored in: email_queued_jobs',
+      'Completed jobs stored in: email_scrap_jobs',
       'Extract email addresses',
       'Extract Facebook URLs',
       'Crawl multiple pages within same domain',

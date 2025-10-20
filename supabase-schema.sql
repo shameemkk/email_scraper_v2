@@ -37,3 +37,25 @@ CREATE TRIGGER update_email_scrap_jobs_updated_at
     FOR EACH ROW 
     EXECUTE FUNCTION update_updated_at_column();
 
+
+-- Create email_queued_jobs table for active/queued jobs
+CREATE TABLE IF NOT EXISTS email_queued_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id VARCHAR(255) UNIQUE NOT NULL,
+    url TEXT NOT NULL,
+    status VARCHAR(50) NOT NULL CHECK (status IN ('queued', 'processing')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    started_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Indexes for active jobs
+CREATE INDEX IF NOT EXISTS idx_email_queued_jobs_status ON email_queued_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_email_queued_jobs_job_id ON email_queued_jobs(job_id);
+CREATE INDEX IF NOT EXISTS idx_email_queued_jobs_created_at ON email_queued_jobs(created_at);
+
+-- Trigger to automatically update updated_at for active jobs
+CREATE TRIGGER update_email_queued_jobs_updated_at 
+    BEFORE UPDATE ON email_queued_jobs 
+    FOR EACH ROW 
+    EXECUTE FUNCTION update_updated_at_column();
