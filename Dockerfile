@@ -34,4 +34,4 @@ COPY . .
 EXPOSE 3000
 
 # Start the application
-CMD ["pm2-runtime", "start", "index.js", "--name", "email-extraction-api"]
+CMD ["pm2-runtime", "start", "index.js", "--name", "email-extraction-api", "--node-args", "--max-old-space-size=20480"]
