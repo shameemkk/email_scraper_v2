@@ -18,8 +18,8 @@ const RATE_LIMIT_DELAY = Math.max(0, parseInt(process.env.RATE_LIMIT_DELAY, 10) 
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
 const SUBPAGE_CONCURRENCY = Math.max(1, parseInt(process.env.SUBPAGE_CONCURRENCY, 10) || 6); // Max secondary links in parallel per job
 const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
-  75,
-  parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || MAX_CONCURRENT_WORKERS
+  1,
+  parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || 75
 );
 const rawScrapeDelayMin = parseInt(process.env.SCRAPE_DELAY_MIN_MS, 75);
 const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 200);
