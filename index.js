@@ -1,28 +1,91 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-// REMOVE: import { AdaptivePlaywrightCrawler } from 'crawlee'; // Remove Crawlee dependency
 import { chromium } from 'playwright'; // Import Playwright directly
 import * as cheerio from 'cheerio'; // Import Cheerio
 import axios from 'axios'; // Import Axios for light HTTP requests
 import { createClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
 
-// Disable Crawlee persistent storage - NOW UNNECESSARY but harmless
-// process.env.CRAWLEE_PERSIST_STORAGE = 'false';
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
-const MAX_CONCURRENT_WORKERS = parseInt(process.env.MAX_CONCURRENT_WORKERS) || 25; 
-const WORKER_BATCH_SIZE = parseInt(process.env.WORKER_BATCH_SIZE) || 25;
-const RATE_LIMIT_DELAY = parseInt(process.env.RATE_LIMIT_DELAY) || 500; // Shorter delay since we do fewer requests per job
-const MAX_DEPTH = parseInt(process.env.MAX_DEPTH) || 2;
+const MAX_CONCURRENT_WORKERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_WORKERS, 10) || 180);
+const rawWorkerBatchSize = parseInt(process.env.WORKER_BATCH_SIZE, 100);
+const WORKER_BATCH_SIZE = Math.max(1, rawWorkerBatchSize || MAX_CONCURRENT_WORKERS);
+const RATE_LIMIT_DELAY = Math.max(0, parseInt(process.env.RATE_LIMIT_DELAY, 10) || 150); // Shorter delay since we do fewer requests per job
+const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
+const SUBPAGE_CONCURRENCY = Math.max(1, parseInt(process.env.SUBPAGE_CONCURRENCY, 10) || 6); // Max secondary links in parallel per job
+const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
+  75,
+  parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || MAX_CONCURRENT_WORKERS
+);
+const rawScrapeDelayMin = parseInt(process.env.SCRAPE_DELAY_MIN_MS, 75);
+const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 200);
+const SCRAPE_DELAY_MIN_MS = Math.max(0, Number.isFinite(rawScrapeDelayMin) ? rawScrapeDelayMin : 200);
+const SCRAPE_DELAY_MAX_MS = Math.max(
+  SCRAPE_DELAY_MIN_MS,
+  Number.isFinite(rawScrapeDelayMax) ? rawScrapeDelayMax : Math.max(SCRAPE_DELAY_MIN_MS, 800)
+);
 // This limit is less relevant now, as the job should only focus on finding the email
-// const PER_INSTANCE_REQUEST_LIMIT = parseInt(process.env.PER_INSTANCE_REQUEST_LIMIT) || 30; 
+// const PER_INSTANCE_REQUEST_LIMIT = parseInt(process.env.PER_INSTANCE_REQUEST_LIMIT, 10) || 30; 
 const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for initial HTTP request
+
+// Shared Playwright browser management for faster fallbacks
+const PLAYWRIGHT_LAUNCH_ARGS = [
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--no-zygote',
+  '--no-sandbox',
+];
+
+let sharedBrowserInstance = null;
+let sharedBrowserPromise = null;
+
+async function getSharedBrowser() {
+  if (sharedBrowserInstance) {
+    return sharedBrowserInstance;
+  }
+
+  if (!sharedBrowserPromise) {
+    sharedBrowserPromise = chromium.launch({
+      headless: true,
+      args: PLAYWRIGHT_LAUNCH_ARGS,
+    });
+  }
+
+  try {
+    sharedBrowserInstance = await sharedBrowserPromise;
+    sharedBrowserInstance.once('disconnected', () => {
+      sharedBrowserInstance = null;
+      sharedBrowserPromise = null;
+    });
+    return sharedBrowserInstance;
+  } catch (error) {
+    sharedBrowserPromise = null;
+    throw error;
+  }
+}
+
+async function resetSharedBrowser() {
+  if (sharedBrowserInstance) {
+    try {
+      await sharedBrowserInstance.close();
+    } catch (error) {
+      console.error('[Playwright] Error closing shared browser:', error.message);
+    }
+  }
+  sharedBrowserInstance = null;
+  sharedBrowserPromise = null;
+}
+
+async function closeSharedBrowser() {
+  if (sharedBrowserPromise || sharedBrowserInstance) {
+    await resetSharedBrowser();
+  }
+}
 
 // Supabase configuration (for storing completed jobs only)
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -399,6 +462,66 @@ function cleanUrl(url) {
   }
 }
 
+/**
+ * Utility to run async tasks with a fixed concurrency limit.
+ * @param {Array<any>} items
+ * @param {number} limit
+ * @param {(item: any, index: number) => Promise<void>} iteratee
+ */
+async function runWithConcurrency(items, limit, iteratee) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return;
+  }
+  
+  const normalizedLimit = Math.max(1, Number.isFinite(limit) ? limit : 1);
+  let currentIndex = 0;
+  
+  const worker = async () => {
+    while (currentIndex < items.length) {
+      const index = currentIndex++;
+      await iteratee(items[index], index);
+    }
+  };
+  
+  const workers = Array.from(
+    { length: Math.min(normalizedLimit, items.length) },
+    () => worker()
+  );
+  
+  await Promise.all(workers);
+}
+
+class AsyncSemaphore {
+  constructor(limit) {
+    this.limit = Math.max(1, Number.isFinite(limit) ? limit : 1);
+    this.active = 0;
+    this.queue = [];
+  }
+
+  async acquire() {
+    if (this.active < this.limit) {
+      this.active++;
+      return;
+    }
+
+    await new Promise(resolve => this.queue.push(resolve));
+    this.active++;
+  }
+
+  release() {
+    if (this.active > 0) {
+      this.active--;
+    }
+
+    if (this.queue.length > 0 && this.active < this.limit) {
+      const resolve = this.queue.shift();
+      resolve();
+    }
+  }
+}
+
+const playwrightContextSemaphore = new AsyncSemaphore(PLAYWRIGHT_MAX_CONTEXTS);
+
 // =========================================================================
 // DATABASE HELPER FUNCTIONS (Updated to use the new async JobQueue methods)
 // =========================================================================
@@ -459,8 +582,13 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
   
   console.log(`[Depth ${depth}] Processing URL: ${url}`);
 
-  // Add random delay to avoid being blocked (200-800ms)
-  await new Promise(resolve => setTimeout(resolve, Math.random() * 600 + 200));
+  // Apply configurable jitter to spread requests when crawling aggressively
+  const scrapeDelay = SCRAPE_DELAY_MAX_MS > 0
+    ? SCRAPE_DELAY_MIN_MS + Math.random() * (SCRAPE_DELAY_MAX_MS - SCRAPE_DELAY_MIN_MS)
+    : 0;
+  if (scrapeDelay > 0) {
+    await new Promise(resolve => setTimeout(resolve, scrapeDelay));
+  }
 
   let htmlContent = '';
   let isJsRendered = false;
@@ -530,9 +658,12 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
     let browser;
     let context;
     let page;
+    let semaphoreAcquired = false;
     try {
-      // Launch Playwright for THIS specific job request (Playwright Launcher)
-      browser = await chromium.launch({ headless: true });
+      // Reuse a shared browser instance for faster startup
+      browser = await getSharedBrowser();
+      await playwrightContextSemaphore.acquire();
+      semaphoreAcquired = true;
       // Create explicit context and page
       context = await browser.newContext();
       page = await context.newPage();
@@ -561,15 +692,10 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       let emails = extractEmails(htmlContent);
       result.emails.push(...emails);
       
-      // *** FIX: Explicitly close Page and Context to free resources quickly ***
-      if (page) await page.close();
-      if (context) await context.close();
-      
       // Extract links if we need to crawl deeper (and if emails weren't found)
       if (depth < MAX_DEPTH) {
         // ... (link extraction logic remains the same, assuming it doesn't need the page/context anymore) ...
-        // NOTE: Since we closed page/context above, we can no longer use `page.evaluate()`.
-        // We must rely on Cheerio/URL parsing of the retrieved `htmlContent` for link extraction if emails were not found.
+        // NOTE: We rely on Cheerio/URL parsing of the retrieved `htmlContent` for link extraction if emails were not found.
         
         if (result.emails.length === 0) {
             const $ = cheerio.load(htmlContent);
@@ -621,6 +747,9 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
 
     } catch (error) {
       console.error(`[Playwright Error] Failed to process ${url}:`, error);
+      if (!browser || !browser.isConnected()) {
+        await resetSharedBrowser();
+      }
       // Update job in Supabase/internal queue with error status to avoid stuck processing
       if (jobId && typeof updateJobStatus === 'function') {
         try {
@@ -634,20 +763,22 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       // Re-throw to let the caller fail the job and stop further processing
       throw error;
     } finally {
-      if (browser) {
+      if (page) {
         try {
-          // Attempt a graceful close
-          await browser.close();
-          console.log(`[Playwright] Browser closed for ${url}`);
+          await page.close();
         } catch (closeErr) {
-          console.error(`[Playwright Close Error] Failed to close gracefully for ${url}: ${closeErr.message}. Attempting disconnect.`);
-          try {
-             // *** FIX: Add disconnect for more aggressive cleanup ***
-             browser.disconnect(); 
-          } catch(e) { 
-             console.error(`[Playwright Disconnect Error] ${e.message}`);
-          }
+          console.error(`[Playwright] Failed to close page for ${url}: ${closeErr.message}`);
         }
+      }
+      if (context) {
+        try {
+          await context.close();
+        } catch (closeErr) {
+          console.error(`[Playwright] Failed to close context for ${url}: ${closeErr.message}`);
+        }
+      }
+      if (semaphoreAcquired) {
+        playwrightContextSemaphore.release();
       }
     }
   }
@@ -697,7 +828,7 @@ async function processJob(jobId, url) {
         })
         .slice(0, 15); // Respect previous crawl limit without a queue
 
-      for (const link of candidateLinks) {
+      await runWithConcurrency(candidateLinks, SUBPAGE_CONCURRENCY, async (link) => {
         try {
           const subResult = await scrapeUrl(link, 1, visitedUrls, jobId);
           subResult.emails.forEach(e => uniqueEmails.add(e));
@@ -707,7 +838,7 @@ async function processJob(jobId, url) {
           // Abort this job to avoid marking it as done after a fatal scraping failure
           throw e;
         }
-      }
+      });
     }
 
     // Remove duplicates and prepare results
@@ -783,7 +914,10 @@ class JobWorker {
       const jobsToProcess = queuedJobs.filter(job => !this.activeJobs.has(job.job_id));
       
       // Process jobs concurrently (limited by MAX_CONCURRENT_WORKERS)
-      const availableWorkers = MAX_CONCURRENT_WORKERS - this.activeJobs.size;
+      const availableWorkers = Math.max(0, MAX_CONCURRENT_WORKERS - this.activeJobs.size);
+      if (availableWorkers <= 0) {
+        return;
+      }
       const finalJobsToProcess = jobsToProcess.slice(0, availableWorkers);
 
       if (finalJobsToProcess.length === 0) return; // No jobs or no available workers
@@ -1012,10 +1146,13 @@ async function startServer() {
       console.log(`Email extraction API running on port ${PORT}`);
       console.log(`Visit http://localhost:${PORT} for API documentation`);
       console.log(`Worker system: ${MAX_CONCURRENT_WORKERS} concurrent workers, batch size: ${WORKER_BATCH_SIZE}`);
+      console.log(`Playwright contexts limit: ${PLAYWRIGHT_MAX_CONTEXTS}, subpage concurrency: ${SUBPAGE_CONCURRENCY}`);
+      console.log(`Scrape delay window: ${SCRAPE_DELAY_MIN_MS}-${SCRAPE_DELAY_MAX_MS}ms`);
     });
     
   } catch (error) {
     console.error('Failed to start server:', error);
+    await closeSharedBrowser();
     process.exit(1);
   }
 }
@@ -1024,12 +1161,14 @@ async function startServer() {
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
   await jobWorker.stop();
+  await closeSharedBrowser();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   console.log('Shutting down gracefully...');
   await jobWorker.stop();
+  await closeSharedBrowser();
   process.exit(0);
 });
 
