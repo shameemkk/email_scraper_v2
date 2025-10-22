@@ -13,13 +13,13 @@ const PORT = process.env.PORT || 3000;
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
 const MAX_CONCURRENT_WORKERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_WORKERS, 10) || 180);
-const WORKER_BATCH_SIZE = process.env.WORKER_BATCH_SIZE;
+const WORKER_BATCH_SIZE = process.env.WORKER_BATCH_SIZE || 15;
 const RATE_LIMIT_DELAY = Math.max(0, parseInt(process.env.RATE_LIMIT_DELAY, 10) || 150); // Shorter delay since we do fewer requests per job
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
 const SUBPAGE_CONCURRENCY = Math.max(1, parseInt(process.env.SUBPAGE_CONCURRENCY, 10) || 6); // Max secondary links in parallel per job
 const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
   1,
-  parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || 75
+  parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || 30
 );
 const rawScrapeDelayMin = parseInt(process.env.SCRAPE_DELAY_MIN_MS, 75);
 const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 200);
