@@ -13,8 +13,7 @@ const PORT = process.env.PORT || 3000;
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
 const MAX_CONCURRENT_WORKERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_WORKERS, 10) || 180);
-const rawWorkerBatchSize = parseInt(process.env.WORKER_BATCH_SIZE, 100);
-const WORKER_BATCH_SIZE = Math.max(1, rawWorkerBatchSize || MAX_CONCURRENT_WORKERS);
+const WORKER_BATCH_SIZE = process.env.WORKER_BATCH_SIZE;
 const RATE_LIMIT_DELAY = Math.max(0, parseInt(process.env.RATE_LIMIT_DELAY, 10) || 150); // Shorter delay since we do fewer requests per job
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
 const SUBPAGE_CONCURRENCY = Math.max(1, parseInt(process.env.SUBPAGE_CONCURRENCY, 10) || 6); // Max secondary links in parallel per job
@@ -669,7 +668,7 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       page = await context.newPage();
       
       // Set a strict timeout (e.g., 60 seconds for the full page load/render)
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }); 
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 40000 }); 
       
       // Wait for page to be fully loaded and any dynamic content to render
       await page.waitForLoadState('networkidle');
