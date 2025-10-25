@@ -21,6 +21,8 @@ RUN apt-get update && apt-get install -y \
 # Copy package files
 COPY package*.json ./
 
+ENV NODE_OPTIONS="--max-old-space-size=30720"
+
 # Install npm dependencies and Playwright artifacts
 RUN npm install && \
     npx playwright install-deps && \
@@ -32,5 +34,5 @@ COPY . .
 # Expose port
 EXPOSE 3000
 
-# Start the application with Node (allow ~30 GB heap on 32 GB host)
-CMD ["node", "--max-old-space-size=30720", "index.js"]
+# Start the application with PM2 Runtime (preserves worker on crashes)
+CMD ["npx", "pm2-runtime", "--max-restarts", "5", "index.js"]

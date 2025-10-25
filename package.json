@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js",
+    "start": "pm2-runtime index.js",
     "dev": "nodemon index.js"
   },
   "keywords": [],
@@ -20,6 +20,7 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "playwright": "^1.56.0",
+    "pm2": "^5.4.2",
     "uuid": "^13.0.0"
   },
   "devDependencies": {

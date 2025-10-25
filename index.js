@@ -13,13 +13,27 @@ const PORT = process.env.PORT || 3000;
 // Configuration
 // MAX_CONCURRENT_WORKERS now limits the number of SIMULTANEOUS Playwright/Cheerio jobs
 const MAX_CONCURRENT_WORKERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_WORKERS, 10) || 180);
-const WORKER_BATCH_SIZE = process.env.WORKER_BATCH_SIZE || 15;
+const parsedWorkerBatchSize = parseInt(process.env.WORKER_BATCH_SIZE, 10);
+const WORKER_BATCH_SIZE = Number.isFinite(parsedWorkerBatchSize)
+  ? Math.max(1, parsedWorkerBatchSize)
+  : 15;
+if (process.env.WORKER_BATCH_SIZE && !Number.isFinite(parsedWorkerBatchSize)) {
+  console.warn('[Config] WORKER_BATCH_SIZE is not a number, defaulting to 15');
+}
 const RATE_LIMIT_DELAY = Math.max(0, parseInt(process.env.RATE_LIMIT_DELAY, 10) || 150); // Shorter delay since we do fewer requests per job
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
 const SUBPAGE_CONCURRENCY = Math.max(1, parseInt(process.env.SUBPAGE_CONCURRENCY, 10) || 6); // Max secondary links in parallel per job
 const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
   1,
   parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10) || 30
+);
+const PROCESSING_STALE_TIMEOUT_MS = Math.max(
+  60000,
+  parseInt(process.env.PROCESSING_STALE_TIMEOUT_MS, 10) || 3 * 60 * 1000
+);
+const STUCK_RECOVERY_INTERVAL_MS = Math.max(
+  15000,
+  parseInt(process.env.STUCK_RECOVERY_INTERVAL_MS, 10) || 60 * 1000
 );
 const rawScrapeDelayMin = parseInt(process.env.SCRAPE_DELAY_MIN_MS, 75);
 const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 200);
@@ -371,6 +385,66 @@ class InternalJobQueue {
     } catch (error) {
       console.error('Error fetching job statistics from Supabase:', error);
       return { total: 0, queued: 0, processing: 0, done: 0, error: 0, message: 'Database query failed' };
+    }
+  }
+
+  async requeueStuckProcessingJobs(timeoutMs = PROCESSING_STALE_TIMEOUT_MS, skipJobIds = []) {
+    if (!supabase) {
+      return { requeued: 0, jobIds: [] };
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from(ACTIVE_JOBS_TABLE)
+        .select('job_id, started_at')
+        .eq('status', 'processing');
+
+      if (error) {
+        console.error('[JobQueue] Failed to fetch processing jobs for recovery:', error);
+        return { requeued: 0, jobIds: [] };
+      }
+
+      const now = Date.now();
+      const skipSet = new Set(skipJobIds || []);
+      const staleJobIds = (data || [])
+        .filter(job => job?.job_id)
+        .filter(job => {
+          if (skipSet.has(job.job_id)) {
+            return false;
+          }
+          return true;
+        })
+        .filter(job => {
+          if (!job.started_at) return true; // No start timestamp recorded
+          const startedAtMs = Date.parse(job.started_at);
+          if (Number.isNaN(startedAtMs)) return true;
+          return now - startedAtMs > timeoutMs;
+        })
+        .map(job => job.job_id);
+
+      if (staleJobIds.length === 0) {
+        return { requeued: 0, jobIds: [] };
+      }
+
+      const { error: updateError } = await supabase
+        .from(ACTIVE_JOBS_TABLE)
+        .update({
+          status: 'queued',
+          started_at: null,
+          updated_at: new Date().toISOString()
+        })
+        .in('job_id', staleJobIds);
+
+      if (updateError) {
+        console.error('[JobQueue] Failed to requeue stuck jobs:', updateError);
+        return { requeued: 0, jobIds: [] };
+      }
+
+      console.warn(`[JobQueue] Requeued ${staleJobIds.length} stuck job(s) that exceeded ${timeoutMs}ms in processing.`);
+      return { requeued: staleJobIds.length, jobIds: staleJobIds };
+    } catch (err) {
+      console.error('[JobQueue] Error while recovering stuck jobs:', err);
+      return { requeued: 0, jobIds: [] };
     }
   }
 }
@@ -874,6 +948,7 @@ class JobWorker {
     // activeJobs set is still useful to prevent multiple workers from picking up 
     // the same job *simultaneously* after the DB query.
     this.activeJobs = new Set(); 
+    this.lastRecoveryCheck = 0;
   }
 
   async start() {
@@ -881,6 +956,10 @@ class JobWorker {
     
     this.isRunning = true;
     console.log('Job worker started');
+
+    // Clean up any stuck processing jobs on startup
+    await jobQueue.requeueStuckProcessingJobs(PROCESSING_STALE_TIMEOUT_MS);
+    this.lastRecoveryCheck = Date.now();
     
     // Process jobs continuously
     while (this.isRunning) {
@@ -902,6 +981,18 @@ class JobWorker {
 
   async processNextBatch() {
     try {
+      const now = Date.now();
+      if (now - this.lastRecoveryCheck >= STUCK_RECOVERY_INTERVAL_MS) {
+        const { jobIds: recoveredJobIds = [] } = await jobQueue.requeueStuckProcessingJobs(
+          PROCESSING_STALE_TIMEOUT_MS
+        );
+        if (recoveredJobIds.length > 0) {
+          recoveredJobIds.forEach(jobId => this.activeJobs.delete(jobId));
+          console.warn(`[Worker] Released ${recoveredJobIds.length} stuck job slot(s) from active set.`);
+        }
+        this.lastRecoveryCheck = now;
+      }
+
       // Get queued jobs from internal queue (now an async Supabase query)
       const queuedJobs = await jobQueue.getQueuedJobs(WORKER_BATCH_SIZE);
 
