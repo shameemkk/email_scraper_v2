@@ -21,9 +21,8 @@ RUN apt-get update && apt-get install -y \
 # Copy package files
 COPY package*.json ./
 
-# Install npm dependencies and global packages
+# Install npm dependencies and Playwright artifacts
 RUN npm install && \
-    npm install -g pm2 && \
     npx playwright install-deps && \
     npx playwright install chromium
 
@@ -33,5 +32,5 @@ COPY . .
 # Expose port
 EXPOSE 3000
 
-# Start the application
-CMD ["pm2-runtime", "start", "index.js", "--name", "email-extraction-api", "--node-args", "--max-old-space-size=20480"]
+# Start the application with Node (allow ~30 GB heap on 32 GB host)
+CMD ["node", "--max-old-space-size=30720", "index.js"]
