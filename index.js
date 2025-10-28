@@ -16,7 +16,7 @@ const MAX_CONCURRENT_WORKERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_W
 const parsedWorkerBatchSize = parseInt(process.env.WORKER_BATCH_SIZE, 10);
 const WORKER_BATCH_SIZE = Number.isFinite(parsedWorkerBatchSize)
   ? Math.max(1, parsedWorkerBatchSize)
-  : 15;
+  : 20;
 if (process.env.WORKER_BATCH_SIZE && !Number.isFinite(parsedWorkerBatchSize)) {
   console.warn('[Config] WORKER_BATCH_SIZE is not a number, defaulting to 15');
 }
@@ -45,6 +45,15 @@ const SCRAPE_DELAY_MAX_MS = Math.max(
 // This limit is less relevant now, as the job should only focus on finding the email
 // const PER_INSTANCE_REQUEST_LIMIT = parseInt(process.env.PER_INSTANCE_REQUEST_LIMIT, 10) || 30; 
 const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for initial HTTP request
+
+const COMMON_PAGE_PATHS = [
+  '/about/',
+  '/contact/',
+  '/about-us/',
+  '/contact-us/',
+  '/privacy/',
+  '/terms',
+];
 
 // Shared Playwright browser management for faster fallbacks
 const PLAYWRIGHT_LAUNCH_ARGS = [
@@ -487,40 +496,134 @@ function extractEmails(html) {
   return [...new Set(emails)]; // Remove duplicates
 }
 
-// Facebook URL extraction function - improved to avoid false links
+// Facebook URL extraction function - improved to handle escaped/encoded links (including script blocks)
 function extractFacebookUrls(text) {
-  // More precise Facebook URL regex that avoids false matches
-  const facebookRegex = /(?:https?:\/\/)?(?:www\.)?(?:facebook\.com|fb\.com)\/(?:profile\.php\?id=\d+|pages\/[a-zA-Z0-9._-]+|groups\/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]{2,})(?:\/[a-zA-Z0-9._-]+)*/gi;
-  const facebookUrls = text.match(facebookRegex) || [];
-  
-  // Filter out common false positives and clean URLs
-  const filteredUrls = facebookUrls.filter(url => {
-    // Clean the URL and remove any trailing slashes or unwanted characters
-    let cleanUrl = url.replace(/^https?:\/\//, '').replace(/^www\./, '');
-    cleanUrl = cleanUrl.replace(/\/+$/, ''); // Remove trailing slashes
-    cleanUrl = cleanUrl.replace(/\\+/g, ''); // Remove backslashes
-    
-    const pathPart = cleanUrl.split('/')[1] || '';
-    
-    // Skip if path is too short (likely not a real profile/page)
-    if (pathPart.length < 2) return false;
-    
-    // Skip common non-profile paths
-    const skipPatterns = ['home', 'login', 'register', 'help', 'privacy', 'terms', 'cookies', 'settings'];
-    if (skipPatterns.includes(pathPart.toLowerCase())) return false;
-    
-    // Skip URLs with backslashes or other invalid characters
-    if (cleanUrl.includes('\\') || cleanUrl.includes('//')) return false;
-    
-    return true;
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    return [];
+  }
+
+  const candidates = new Set();
+  const allowedShortSegments = new Set(['p', 'sharer.php', 'share.php']);
+
+  const patterns = [
+    /https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>\\)]+/gi,
+    /https?:\\\/\\\/(?:www\.)?(?:facebook\.com|fb\.com)[^"'<>\\)]+/gi,
+    /https?%3A%2F%2F(?:www\.)?(?:facebook\.com|fb\.com)[^"'<>\\)]+/gi
+  ];
+
+  patterns.forEach(pattern => {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      candidates.add(match[0]);
+    }
   });
-  
-  // Clean up the final URLs
-  const finalUrls = filteredUrls.map(url => {
-    return url.replace(/\\+/g, '').replace(/\/+$/, '');
-  });
-  
-  return [...new Set(finalUrls)]; // Remove duplicates
+
+  const barePattern = /(?:facebook\.com|fb\.com)\/[^\s"'<>\\)]+/gi;
+  let bareMatch;
+  while ((bareMatch = barePattern.exec(text)) !== null) {
+    candidates.add(`https://${bareMatch[0]}`);
+  }
+
+  const results = new Set();
+  for (const candidate of candidates) {
+    const normalized = normalizeFacebookCandidate(candidate);
+    if (normalized) {
+      results.add(normalized);
+    }
+  }
+
+  return Array.from(results);
+
+  function normalizeFacebookCandidate(rawValue, depth = 0) {
+    if (!rawValue || typeof rawValue !== 'string') {
+      return null;
+    }
+    if (depth > 3) {
+      return null;
+    }
+
+    let value = rawValue.trim();
+    if (!value) {
+      return null;
+    }
+
+    value = value
+      .replace(/\\u0026/gi, '&')
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\u003A/gi, ':')
+      .replace(/\\x2F/gi, '/')
+      .replace(/\\x3A/gi, ':')
+      .replace(/\\\//g, '/')
+      .replace(/\\\\/g, '\\')
+      .replace(/&amp;/gi, '&')
+      .replace(/^['"`]+|['"`]+$/g, '');
+
+    if (/^https?%3A%2F%2F/i.test(value) || value.includes('%2F') || value.includes('%3A')) {
+      try {
+        value = decodeURIComponent(value);
+      } catch {
+        // Ignore malformed URI components
+      }
+    }
+
+    if (!/^https?:\/\//i.test(value)) {
+      if (value.startsWith('//')) {
+        value = `https:${value}`;
+      } else if (/^(?:www\.)?(facebook\.com|fb\.com)/i.test(value)) {
+        value = `https://${value.replace(/^https?:\\\/\\\//i, '')}`;
+      }
+    }
+
+    value = value.replace(/\/+$/, '');
+
+    let urlObj;
+    try {
+      urlObj = new URL(value);
+    } catch {
+      return null;
+    }
+
+    const hostname = urlObj.hostname.toLowerCase();
+    const allowedDomains = ['facebook.com', 'fb.com'];
+    const isAllowedHost = allowedDomains.some(domain => hostname === domain || hostname.endsWith(`.${domain}`));
+    if (!isAllowedHost) {
+      return null;
+    }
+
+    if (hostname.endsWith('facebook.com') && urlObj.pathname === '/l.php') {
+      const forwarded = urlObj.searchParams.get('u') || urlObj.searchParams.get('href');
+      if (forwarded) {
+        return normalizeFacebookCandidate(forwarded, depth + 1);
+      }
+    }
+
+    const trackingParams = [
+      'fbclid',
+      'utm_source',
+      'utm_medium',
+      'utm_campaign',
+      'utm_term',
+      'utm_content',
+      'mibextid',
+      'ref',
+      'refid'
+    ];
+    trackingParams.forEach(param => urlObj.searchParams.delete(param));
+    urlObj.hash = '';
+    const searchString = urlObj.searchParams.toString();
+    urlObj.search = searchString ? `?${searchString}` : '';
+
+    const firstPathSegment = urlObj.pathname.split('/').filter(Boolean)[0] || '';
+    if (
+      firstPathSegment.length > 0 &&
+      firstPathSegment.length < 2 &&
+      !allowedShortSegments.has(firstPathSegment.toLowerCase())
+    ) {
+      return null;
+    }
+
+    return urlObj.toString();
+  }
 }
 
 // URL cleaning function to remove hash fragments
@@ -533,6 +636,79 @@ function cleanUrl(url) {
     // If URL parsing fails, try simple string replacement
     return url.split('#')[0];
   }
+}
+
+function generateCommonPageVariants(pagePath) {
+  const variants = new Set();
+  if (typeof pagePath !== 'string') {
+    return variants;
+  }
+
+  const trimmed = pagePath.trim();
+  if (!trimmed) {
+    return variants;
+  }
+
+  const ensureTrailingSlash = (value) =>
+    value && !value.endsWith('/') ? `${value}/` : value;
+
+  const withoutLeadingSlash = trimmed.replace(/^\/+/, '');
+
+  variants.add(trimmed);
+  variants.add(ensureTrailingSlash(trimmed));
+
+  if (withoutLeadingSlash) {
+    variants.add(withoutLeadingSlash);
+    variants.add(ensureTrailingSlash(withoutLeadingSlash));
+
+    const withLeadingSlash = `/${withoutLeadingSlash}`;
+    variants.add(withLeadingSlash);
+    variants.add(ensureTrailingSlash(withLeadingSlash));
+  }
+
+  return variants;
+}
+
+function createSameDomainLinkCollector(baseUrlHref) {
+  const baseUrl = new URL(baseUrlHref);
+  const normalizedCurrentUrl = cleanUrl(baseUrl.href);
+  const prioritizedLinks = [];
+  const seenLinks = new Set();
+
+  const addCandidateLink = (candidate) => {
+    if (!candidate) {
+      return;
+    }
+    try {
+      const linkUrl = new URL(candidate, baseUrl.href);
+      if (linkUrl.origin !== baseUrl.origin) {
+        return;
+      }
+      const finalUrl = cleanUrl(linkUrl.href);
+      if (finalUrl === normalizedCurrentUrl || seenLinks.has(finalUrl)) {
+        return;
+      }
+      seenLinks.add(finalUrl);
+      prioritizedLinks.push(finalUrl);
+    } catch {
+      // Skip invalid URLs
+    }
+  };
+
+  const addCommonPages = () => {
+    for (const pagePath of COMMON_PAGE_PATHS) {
+      const variants = generateCommonPageVariants(pagePath);
+      for (const variant of variants) {
+        addCandidateLink(variant);
+      }
+    }
+  };
+
+  return {
+    addCandidateLink,
+    addCommonPages,
+    getLinks: () => prioritizedLinks,
+  };
 }
 
 /**
@@ -688,34 +864,48 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
       decompress: true, // Automatically decompress gzipped responses
     });
     
-    htmlContent = response.data;
-    
-    // Attempt extraction with Cheerio
-    let emails = extractEmails(htmlContent);
+      htmlContent = response.data;
+
+      // Collect Facebook links from the static HTML pass
+      const facebookLinks = extractFacebookUrls(htmlContent);
+      if (facebookLinks.length > 0) {
+        result.facebookUrls.push(...facebookLinks);
+      }
+
+      // Attempt extraction with Cheerio
+      let emails = extractEmails(htmlContent);
 
     if (emails.length > 0) {
       result.emails.push(...emails);
       console.log(`[Cheerio] Found ${emails.length} emails. Job successful.`);
       
-      // If emails found, only extract navigation links for quick domain coverage
+      // If emails found, gather next targets from navigation plus common pages
       const $ = cheerio.load(htmlContent);
-      const baseUrl = new URL(url);
+      const linkCollector = createSameDomainLinkCollector(url);
+      linkCollector.addCommonPages();
+
       const navLinks = $('nav a, header a, .navbar a, .nav a, .navigation a, .menu a, .main-menu a, .primary-menu a, .top-menu a, [role="navigation"] a, .site-nav a, .main-nav a')
         .map((i, el) => {
           const href = $(el).attr('href');
           if (!href || href.startsWith('#') || href.startsWith('javascript:')) return null;
           try {
-            // Convert to absolute URL and clean hash fragments
-            const absoluteUrl = new URL(href, url).href;
-            return cleanUrl(absoluteUrl);
+            return new URL(href, url).href;
           } catch {
             return null;
           }
         })
         .get()
-        .filter(href => href !== null);
-      
-      result.newUrls.push(...navLinks);
+        .filter(Boolean);
+
+      for (const link of navLinks) {
+        linkCollector.addCandidateLink(link);
+      }
+
+      const collectedLinks = linkCollector.getLinks();
+      if (collectedLinks.length > 0) {
+        result.newUrls.push(...collectedLinks);
+      }
+
       return result; // Early exit if successful with Cheerio
     }
 
@@ -757,10 +947,14 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
         console.log('[Playwright] No email-related selectors found, continuing...');
       } 
 
-      htmlContent = await page.content();
-      
-      // Debug logging to see what content was loaded
-      console.log(`[Playwright] HTML content length: ${htmlContent.length}`);
+        htmlContent = await page.content();
+        const facebookLinks = extractFacebookUrls(htmlContent);
+        if (facebookLinks.length > 0) {
+          result.facebookUrls.push(...facebookLinks);
+        }
+        
+        // Debug logging to see what content was loaded
+        console.log(`[Playwright] HTML content length: ${htmlContent.length}`);
       
       let emails = extractEmails(htmlContent);
       result.emails.push(...emails);
@@ -777,42 +971,25 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
                     const href = $(el).attr('href');
                     if (!href || href.startsWith('#') || href.startsWith('javascript:')) return null;
                     try {
-                        // Convert to absolute URL and clean hash fragments
-                        const absoluteUrl = new URL(href, url).href;
-                        return cleanUrl(absoluteUrl);
+                        return new URL(href, url).href;
                     } catch {
                         return null;
                     }
                 })
                 .get()
-                .filter(href => href !== null);
-                
-            // Filter links to stay on the same domain and convert to absolute URLs
-            const baseUrl = new URL(url);
-            const sameDomainLinks = [];
-            
+                .filter(Boolean);
+
+            const linkCollector = createSameDomainLinkCollector(url);
+            linkCollector.addCommonPages();
+
             for (const link of links) {
-                try {
-                    const linkUrl = new URL(link);
-                    // Only include links from the same origin
-                    if (linkUrl.origin === baseUrl.origin) {
-                      sameDomainLinks.push(link);
-                    }
-                } catch {
-                    // Skip invalid URLs
-                }
+              linkCollector.addCandidateLink(link);
             }
 
-            // Add specific common pages to crawl
-            const commonPages = [ '/about', '/contact', '/about-us/', '/contact-us/', '/privacy', '/terms'];
-            for (const pagePath of commonPages) {
-                try {
-                    const fullUrl = new URL(pagePath, url).href;
-                    sameDomainLinks.push(fullUrl);
-                } catch (e) { /* skip invalid URLs */ }
+            const collectedLinks = linkCollector.getLinks();
+            if (collectedLinks.length > 0) {
+              result.newUrls.push(...collectedLinks);
             }
-
-            result.newUrls.push(...sameDomainLinks);
         }
       }
       
@@ -856,13 +1033,12 @@ async function scrapeUrl(url, depth, visitedUrls, jobId) {
     }
   }
 
-
   // --- 3. Final Check & Fallback Extraction (if no emails found) ---
   if (result.emails.length === 0) {
     // Only extract Facebook URLs if no emails were found on the primary page
     result.facebookUrls.push(...extractFacebookUrls(htmlContent));
   }
-  
+
   return result;
 }
 
@@ -899,7 +1075,7 @@ async function processJob(jobId, url) {
             return false;
           }
         })
-        .slice(0, 15); // Respect previous crawl limit without a queue
+        .slice(0, 23); // Respect previous crawl limit without a queue
 
       await runWithConcurrency(candidateLinks, SUBPAGE_CONCURRENCY, async (link) => {
         try {
